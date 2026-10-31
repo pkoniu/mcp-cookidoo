@@ -10,7 +10,9 @@ An MCP (Model Context Protocol) server for interacting with the Thermomix Cookid
 - **Recipe Details**: Fetch ingredients, steps and times of any Cookidoo recipe
 - **Custom Recipes**: List, read, create and update the recipes on your own account
 - **Guided Cooking**: Steps can carry Thermomix settings (time, temperature, speed, reverse), preset on the machine
-- **Guided Prompt**: `create_thermomix_recipe` walks the assistant through writing a proper Thermomix recipe (EN / FR)
+- **Meal Plan**: Read the Cookidoo calendar week by week, plan or unplan recipes on a day
+- **Shopping List**: Add recipes' ingredients and your own items, tick them off, clear the list
+- **Guided Prompts**: `plan_my_week` plans meals and fills the shopping list; `create_thermomix_recipe` walks the assistant through writing a proper Thermomix recipe (EN / FR)
 
 ## Setup
 
@@ -92,6 +94,32 @@ uv run fastmcp dev inspector fastmcp.json           # MCP Inspector
 | `generate_recipe_structure` | Validate a new recipe and return its JSON |
 | `upload_custom_recipe` | Create a custom recipe from that JSON |
 | `update_custom_recipe` | Replace an existing custom recipe with that JSON |
+| `get_meal_plan` | Get the recipes planned on each day of a week |
+| `add_to_meal_plan` | Plan catalogue and/or custom recipes on a day |
+| `remove_from_meal_plan` | Remove a planned recipe from a day |
+| `get_shopping_list` | Get the shopping list: recipes, ingredients to buy, own items, ticked items |
+| `add_recipes_to_shopping_list` | Add the ingredients of recipes to the shopping list |
+| `remove_recipes_from_shopping_list` | Remove recipes and their ingredients from the shopping list |
+| `add_shopping_items` | Add free-text items ("2 lemons", "kitchen roll") |
+| `mark_shopping_items` | Tick items off as bought / owned, or untick them |
+| `rename_shopping_item` | Rename one of your own items |
+| `remove_shopping_items` | Remove your own items |
+| `clear_shopping_list` | Empty the whole shopping list |
+| `shop_for_meal_plan` | Add every recipe planned in a week to the shopping list |
+
+## Meal plan & shopping list
+
+Dates are `YYYY-MM-DD`; a week is given by any of its dates (today by default). Calendar and
+shopping list tools take catalogue recipe IDs (`r59322`, from `search_recipes`) and custom
+recipe IDs (from `list_custom_recipes`) alike. A typical flow, which the `plan_my_week`
+prompt walks through:
+
+1. `search_recipes` for ideas, then `add_to_meal_plan` for each day
+2. `shop_for_meal_plan` to put the week's ingredients on the shopping list (recipes already
+   on it are skipped)
+3. `get_shopping_list`, then `mark_shopping_items` for what you already have
+
+Recipe ingredients can't be removed one by one: tick them off, or remove their recipe.
 
 ## Recipe steps
 

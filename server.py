@@ -9,8 +9,11 @@ import re
 import tomllib
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import date
 from pathlib import Path
 
+from cookidoo_api import CookidooAdditionalItem, CookidooIngredientItem
+from cookidoo_api.types import CookidooCalendarDay
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from pydantic import ValidationError
@@ -23,6 +26,7 @@ PROMPTS_DIR = Path(__file__).parent
 VERSION = tomllib.loads((PROMPTS_DIR / "pyproject.toml").read_text())["project"]["version"]
 READ_ONLY = {"readOnlyHint": True, "openWorldHint": True}
 WRITE = {"readOnlyHint": False, "destructiveHint": False, "openWorldHint": True}
+DESTRUCTIVE = {**WRITE, "destructiveHint": True}
 
 # Module-level authenticated session, created lazily on first use
 _cookidoo_service: CookidooService | None = None
@@ -41,9 +45,11 @@ mcp = FastMCP(
     "cookidoo-mcp-server",
     version=VERSION,
     instructions=(
-        "Tools for the Thermomix Cookidoo platform: search recipes, read them, and create "
-        "or edit the user's own custom recipes. Always show a recipe to the user and get "
-        "explicit approval before creating or updating it."
+        "Tools for the Thermomix Cookidoo platform: search recipes, read them, create "
+        "or edit the user's own custom recipes, plan meals on the Cookidoo calendar and "
+        "manage the shopping list. Always show a recipe to the user and get explicit "
+        "approval before creating or updating it, and confirm before clearing the "
+        "shopping list or removing several planned meals."
     ),
     lifespan=lifespan,
 )
@@ -96,6 +102,53 @@ def _minutes(seconds: int | None) -> str:
 
 def _strip_markup(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text).strip()
+
+
+def _ids(value: list[str] | str) -> list[str]:
+    """Accept a list of IDs, or a string of IDs separated by commas or newlines."""
+    ids = _split_list(value) if isinstance(value, str) else [v.strip() for v in value]
+    ids = [i for i in ids if i]
+    if not ids:
+        raise ToolError("Provide at least one ID.")
+    return ids
+
+
+def _parse_day(value: str) -> date:
+    """An ISO date (YYYY-MM-DD); empty means today."""
+    if not value.strip():
+        return date.today()
+    try:
+        return date.fromisoformat(value.strip())
+    except ValueError as e:
+        raise ToolError(f"Invalid date '{value}': use the YYYY-MM-DD format.") from e
+
+
+def _format_day(day: CookidooCalendarDay) -> list[str]:
+    lines = [f"{day.title} ({day.id}):" if day.title != day.id else f"{day.id}:"]
+    for recipe in day.recipes:
+        kind = ", custom" if recipe.is_custom else ""
+        lines.append(f"  - {recipe.name} ({_minutes(recipe.total_time)}{kind}) | ID: {recipe.id}")
+    loaded = {recipe.id for recipe in day.recipes}
+    for recipe_id in day.customer_recipe_ids:
+        if recipe_id not in loaded:
+            lines.append(f"  - Custom recipe that could not be loaded | ID: {recipe_id}")
+    if len(lines) == 1:
+        lines.append("  (nothing planned)")
+    return lines
+
+
+def _week_recipe_ids(days: list[CookidooCalendarDay]) -> list[str]:
+    """Every recipe planned in the week, once, in calendar order."""
+    ids = [r.id for day in days for r in day.recipes]
+    ids += [i for day in days for i in day.customer_recipe_ids]
+    return list(dict.fromkeys(ids))
+
+
+def _item_line(item: CookidooIngredientItem | CookidooAdditionalItem) -> str:
+    text = " ".join(p for p in (getattr(item, "description", ""), item.name) if p)
+    if preparation := getattr(item, "preparation", None):
+        text += f", {preparation}"
+    return f"  - {text} | ID: {item.id}"
 
 
 @mcp.tool(annotations=READ_ONLY)
@@ -325,6 +378,272 @@ async def update_custom_recipe(recipe_id: str, recipe_json: str) -> str:
     except Exception as e:
         raise ToolError(f"Update failed: {e}") from e
     return f"Recipe '{updated.name}' updated.\nRecipe ID: {updated.id}\nURL: {updated.url}"
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def get_meal_plan(week_of: str = "") -> str:
+    """
+    Get the Cookidoo meal plan (calendar) of a week: the recipes planned on each day.
+
+    Args:
+        week_of: Any date in the week, as YYYY-MM-DD (default: today)
+    """
+    day = _parse_day(week_of)
+    try:
+        days = await _get_service().get_calendar_week(day)
+    except Exception as e:
+        raise ToolError(f"Failed to get the meal plan: {e}") from e
+
+    if not days:
+        return f"Nothing planned in the week of {day.isoformat()}."
+    lines = [f"Meal plan for the week of {day.isoformat()}:"]
+    for calendar_day in days:
+        lines += ["", *_format_day(calendar_day)]
+    return "\n".join(lines)
+
+
+@mcp.tool(annotations=WRITE)
+async def add_to_meal_plan(day: str, recipe_ids: list[str] | str) -> str:
+    """
+    Plan recipes on a day of the Cookidoo calendar.
+
+    Works with catalogue recipes (IDs like "r59322", from search_recipes) and the
+    user's custom recipes (IDs from list_custom_recipes).
+
+    Args:
+        day: The date, as YYYY-MM-DD
+        recipe_ids: Recipe IDs, as a list or comma-separated
+    """
+    when = _parse_day(day)
+    ids = _ids(recipe_ids)
+    try:
+        calendar_day = await _get_service().add_to_calendar(when, ids)
+    except Exception as e:
+        raise ToolError(f"Failed to add to the meal plan: {e}") from e
+    return "Meal plan updated.\n\n" + "\n".join(_format_day(calendar_day))
+
+
+@mcp.tool(annotations=DESTRUCTIVE)
+async def remove_from_meal_plan(day: str, recipe_id: str) -> str:
+    """
+    Remove a planned recipe from a day of the Cookidoo calendar.
+
+    Args:
+        day: The date the recipe is planned on, as YYYY-MM-DD
+        recipe_id: The recipe ID, as shown by get_meal_plan
+    """
+    when = _parse_day(day)
+    try:
+        calendar_day = await _get_service().remove_from_calendar(when, recipe_id.strip())
+    except Exception as e:
+        raise ToolError(f"Failed to remove from the meal plan: {e}") from e
+    return "Meal plan updated.\n\n" + "\n".join(_format_day(calendar_day))
+
+
+@mcp.tool(annotations=READ_ONLY)
+async def get_shopping_list() -> str:
+    """
+    Get the Cookidoo shopping list: the recipes on it, their ingredients and the user's
+    own items, split into what is still to buy and what is already ticked off.
+    """
+    try:
+        shopping = await _get_service().get_shopping_list()
+    except Exception as e:
+        raise ToolError(f"Failed to get the shopping list: {e}") from e
+
+    items = [*shopping.ingredients, *shopping.additional]
+    if not (shopping.recipes or items):
+        return "The shopping list is empty."
+    lines: list[str] = []
+    if shopping.recipes:
+        lines += ["Recipes:", *(f"  - {r.name} | ID: {r.id}" for r in shopping.recipes), ""]
+    sections = [
+        ("To buy (recipe ingredients):", [i for i in shopping.ingredients if not i.is_owned]),
+        ("To buy (own items):", [i for i in shopping.additional if not i.is_owned]),
+        ("Already have:", [i for i in items if i.is_owned]),
+    ]
+    for title, section in sections:
+        if section:
+            lines += [title, *map(_item_line, section), ""]
+    return "\n".join(lines).strip()
+
+
+@mcp.tool(annotations=WRITE)
+async def add_recipes_to_shopping_list(recipe_ids: list[str] | str) -> str:
+    """
+    Add the ingredients of recipes to the Cookidoo shopping list.
+
+    Works with catalogue recipes (IDs like "r59322") and custom recipes.
+
+    Args:
+        recipe_ids: Recipe IDs, as a list or comma-separated
+    """
+    ids = _ids(recipe_ids)
+    try:
+        added = await _get_service().add_recipes_to_shopping_list(ids)
+    except Exception as e:
+        raise ToolError(f"Failed to add recipes to the shopping list: {e}") from e
+    return f"Added {len(ids)} recipe(s) to the shopping list ({len(added)} ingredients)."
+
+
+@mcp.tool(annotations=DESTRUCTIVE)
+async def remove_recipes_from_shopping_list(recipe_ids: list[str] | str) -> str:
+    """
+    Remove recipes and their ingredients from the Cookidoo shopping list.
+
+    Args:
+        recipe_ids: Recipe IDs, as shown by get_shopping_list
+    """
+    ids = _ids(recipe_ids)
+    try:
+        await _get_service().remove_recipes_from_shopping_list(ids)
+    except Exception as e:
+        raise ToolError(f"Failed to remove recipes from the shopping list: {e}") from e
+    return f"Removed {len(ids)} recipe(s) from the shopping list."
+
+
+@mcp.tool(annotations=WRITE)
+async def add_shopping_items(items: list[str] | str) -> str:
+    """
+    Add free-text items (not from a recipe) to the Cookidoo shopping list,
+    e.g. "kitchen roll" or "2 lemons".
+
+    Args:
+        items: The items, as a list (or one per line)
+    """
+    names = _lines(items)
+    if not names:
+        raise ToolError("Provide at least one item.")
+    try:
+        added = await _get_service().add_shopping_items(names)
+    except Exception as e:
+        raise ToolError(f"Failed to add items to the shopping list: {e}") from e
+    return "Added to the shopping list:\n" + "\n".join(map(_item_line, added))
+
+
+@mcp.tool(annotations={**WRITE, "idempotentHint": True})
+async def mark_shopping_items(item_ids: list[str] | str, owned: bool = True) -> str:
+    """
+    Tick shopping list items off as bought / already owned, or untick them.
+
+    Works for recipe ingredients and own items.
+
+    Args:
+        item_ids: Item IDs, as shown by get_shopping_list
+        owned: True to tick the items off, False to put them back on the list
+    """
+    ids = _ids(item_ids)
+    try:
+        edited = await _get_service().set_items_owned(ids, owned)
+    except Exception as e:
+        raise ToolError(f"Failed to update the shopping list: {e}") from e
+    state = "ticked off" if owned else "put back on the list"
+    return f"{len(edited)} item(s) {state}:\n" + "\n".join(map(_item_line, edited))
+
+
+@mcp.tool(annotations={**WRITE, "idempotentHint": True})
+async def rename_shopping_item(item_id: str, name: str) -> str:
+    """
+    Rename one of the user's own shopping list items (recipe ingredients cannot be renamed).
+
+    Args:
+        item_id: The item ID, as shown by get_shopping_list
+        name: The new text of the item
+    """
+    if not name.strip():
+        raise ToolError("Provide the new name.")
+    try:
+        item = await _get_service().rename_shopping_item(item_id.strip(), name.strip())
+    except Exception as e:
+        raise ToolError(f"Failed to rename the item: {e}") from e
+    return "Item renamed:\n" + _item_line(item)
+
+
+@mcp.tool(annotations=DESTRUCTIVE)
+async def remove_shopping_items(item_ids: list[str] | str) -> str:
+    """
+    Remove the user's own items from the Cookidoo shopping list. Recipe ingredients
+    cannot be removed one by one: tick them off with mark_shopping_items, or remove
+    their recipe with remove_recipes_from_shopping_list.
+
+    Args:
+        item_ids: Item IDs, as shown by get_shopping_list
+    """
+    ids = _ids(item_ids)
+    try:
+        await _get_service().remove_shopping_items(ids)
+    except Exception as e:
+        raise ToolError(f"Failed to remove items: {e}") from e
+    return f"Removed {len(ids)} item(s) from the shopping list."
+
+
+@mcp.tool(annotations=DESTRUCTIVE)
+async def clear_shopping_list() -> str:
+    """
+    Empty the Cookidoo shopping list: all recipes, ingredients and own items.
+
+    Only call this after the user explicitly confirmed it.
+    """
+    try:
+        await _get_service().clear_shopping_list()
+    except Exception as e:
+        raise ToolError(f"Failed to clear the shopping list: {e}") from e
+    return "The shopping list is now empty."
+
+
+@mcp.tool(annotations=WRITE)
+async def shop_for_meal_plan(week_of: str = "") -> str:
+    """
+    Add every recipe planned in a week of the meal plan to the shopping list.
+    Recipes already on the shopping list are skipped.
+
+    Args:
+        week_of: Any date in the week, as YYYY-MM-DD (default: today)
+    """
+    day = _parse_day(week_of)
+    service = _get_service()
+    try:
+        days = await service.get_calendar_week(day)
+        on_list = {recipe.id for recipe in (await service.get_shopping_list()).recipes}
+        to_add = [i for i in _week_recipe_ids(days) if i not in on_list]
+        added = await service.add_recipes_to_shopping_list(to_add) if to_add else []
+    except Exception as e:
+        raise ToolError(f"Failed to shop for the meal plan: {e}") from e
+
+    skipped = len(_week_recipe_ids(days)) - len(to_add)
+    if not to_add:
+        if skipped:
+            return "Every recipe of that week is already on the shopping list."
+        return f"Nothing planned in the week of {day.isoformat()}."
+    text = f"Added {len(to_add)} recipe(s) to the shopping list ({len(added)} ingredients)."
+    if skipped:
+        text += f" {skipped} recipe(s) were already on it."
+    return text
+
+
+@mcp.prompt
+def plan_my_week(days: int = 7, preferences: str = "", start: str = "") -> str:
+    """
+    Guided workflow to plan meals on the Cookidoo calendar and fill the shopping list.
+
+    Args:
+        days: Number of days to plan
+        preferences: Diet, dislikes, time limits, ingredients to use up...
+        start: First day, as YYYY-MM-DD (default: today)
+    """
+    first = start or date.today().isoformat()
+    wishes = f" Preferences: {preferences}." if preferences else ""
+    return (
+        f"Help me plan {days} days of meals on Cookidoo, starting {first}.{wishes}\n\n"
+        "1. Check what is already planned with get_meal_plan, and what is on the shopping "
+        "list with get_shopping_list.\n"
+        "2. Find recipes with search_recipes (and list_custom_recipes for my own), with "
+        "some variety and dishes that share ingredients.\n"
+        "3. Show me the plan, one line per day, and wait for my approval or changes.\n"
+        "4. Once I approve, add the recipes day by day with add_to_meal_plan.\n"
+        "5. Ask whether to add them to the shopping list; if yes, use shop_for_meal_plan "
+        "(once per calendar week covered), then show the list with get_shopping_list."
+    )
 
 
 @mcp.prompt

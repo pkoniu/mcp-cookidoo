@@ -6,15 +6,20 @@ Module to encapsulate all cookidoo-api logic for interacting with the Cookidoo p
 
 import asyncio
 import os
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field, replace
+from datetime import date
 
 from aiohttp import ClientSession
 from cookidoo_api import (
     Cookidoo,
+    CookidooAdditionalItem,
     CookidooConfig,
     CookidooCreateCustomRecipe,
     CookidooCustomRecipe,
+    CookidooIngredientItem,
     CookidooSearchResult,
+    CookidooShoppingRecipe,
     CookidooShoppingRecipeDetails,
     CookidooUpdateCustomRecipe,
     ThermomixMachineType,
@@ -25,6 +30,7 @@ from cookidoo_api.helpers import (
     cookidoo_search_result_from_json,
     get_localization_options,
 )
+from cookidoo_api.types import CookidooCalendarDay
 from dotenv import load_dotenv
 
 from guided import to_instruction
@@ -40,6 +46,27 @@ class CookidooSettings:
     country: str = "fr"
     language: str = "fr-FR"
     device: ThermomixMachineType = ThermomixMachineType.TM6
+
+
+@dataclass
+class ShoppingList:
+    """The whole shopping list: recipes, their ingredients and the user's own items."""
+
+    recipes: list[CookidooShoppingRecipe] = field(default_factory=list)
+    ingredients: list[CookidooIngredientItem] = field(default_factory=list)
+    additional: list[CookidooAdditionalItem] = field(default_factory=list)
+
+
+def is_catalogue_id(recipe_id: str) -> bool:
+    """Catalogue recipe IDs look like "r59322"; custom recipe IDs are ULIDs."""
+    return re.fullmatch(r"r\d+", recipe_id) is not None
+
+
+def split_recipe_ids(recipe_ids: list[str]) -> tuple[list[str], list[str]]:
+    """Split recipe IDs into (catalogue, custom), keeping their order."""
+    catalogue = [i for i in recipe_ids if is_catalogue_id(i)]
+    custom = [i for i in recipe_ids if not is_catalogue_id(i)]
+    return catalogue, custom
 
 
 def load_cookidoo_settings() -> CookidooSettings:
@@ -240,6 +267,109 @@ class CookidooService:
                 hints=recipe.hints or [],
             ),
         )
+
+    async def get_calendar_week(self, day: date) -> list[CookidooCalendarDay]:
+        """The meal plan of the week containing `day`, custom recipes included."""
+        api = await self.client()
+        return await api.get_recipes_in_calendar_week(day, resolve_custom_recipes=True)
+
+    async def add_to_calendar(self, day: date, recipe_ids: list[str]) -> CookidooCalendarDay:
+        """Plan catalogue and/or custom recipes on a day; returns the updated day."""
+        api = await self.client()
+        catalogue, custom = split_recipe_ids(recipe_ids)
+        if not (catalogue or custom):
+            raise ValueError("No recipe IDs given")
+        if catalogue:
+            calendar_day = await api.add_recipes_to_calendar(day, catalogue)
+        if custom:
+            calendar_day = await api.add_custom_recipes_to_calendar(day, custom)
+        return calendar_day
+
+    async def remove_from_calendar(self, day: date, recipe_id: str) -> CookidooCalendarDay:
+        """Remove a planned recipe from a day; returns the updated day."""
+        api = await self.client()
+        if is_catalogue_id(recipe_id):
+            return await api.remove_recipe_from_calendar(day, recipe_id)
+        return await api.remove_custom_recipe_from_calendar(day, recipe_id)
+
+    async def get_shopping_list(self) -> ShoppingList:
+        api = await self.client()
+        recipes, ingredients, additional = await asyncio.gather(
+            api.get_shopping_list_recipes(),
+            api.get_ingredient_items(),
+            api.get_additional_items(),
+        )
+        return ShoppingList(recipes=recipes, ingredients=ingredients, additional=additional)
+
+    async def add_recipes_to_shopping_list(
+        self, recipe_ids: list[str]
+    ) -> list[CookidooIngredientItem]:
+        """Add the ingredients of catalogue and/or custom recipes; returns the added items."""
+        api = await self.client()
+        catalogue, custom = split_recipe_ids(recipe_ids)
+        added: list[CookidooIngredientItem] = []
+        if catalogue:
+            added += await api.add_ingredient_items_for_recipes(catalogue)
+        if custom:
+            added += await api.add_ingredient_items_for_custom_recipes(custom)
+        return added
+
+    async def remove_recipes_from_shopping_list(self, recipe_ids: list[str]) -> None:
+        api = await self.client()
+        catalogue, custom = split_recipe_ids(recipe_ids)
+        if catalogue:
+            await api.remove_ingredient_items_for_recipes(catalogue)
+        if custom:
+            await api.remove_ingredient_items_for_custom_recipes(custom)
+
+    async def add_shopping_items(self, names: list[str]) -> list[CookidooAdditionalItem]:
+        api = await self.client()
+        return await api.add_additional_items(names)
+
+    async def rename_shopping_item(self, item_id: str, name: str) -> CookidooAdditionalItem:
+        """Rename one of the user's own items (recipe ingredients cannot be renamed)."""
+        api = await self.client()
+        items = {item.id: item for item in await api.get_additional_items()}
+        if item_id not in items:
+            raise ValueError(f"No own item with ID '{item_id}' on the shopping list")
+        [renamed] = await api.edit_additional_items([replace(items[item_id], name=name)])
+        return renamed
+
+    async def set_items_owned(
+        self, item_ids: list[str], owned: bool
+    ) -> list[CookidooIngredientItem | CookidooAdditionalItem]:
+        """
+        Tick (owned) or untick ingredients and own items.
+
+        The API edits ownership from full item objects, so the current items are
+        loaded first and the given IDs are matched against both kinds.
+        """
+        api = await self.client()
+        ingredients, additional = await asyncio.gather(
+            api.get_ingredient_items(), api.get_additional_items()
+        )
+        ingredient_ids = {item.id for item in ingredients}
+        additional_ids = {item.id for item in additional}
+        unknown = [i for i in item_ids if i not in ingredient_ids | additional_ids]
+        if unknown:
+            raise ValueError(f"Unknown shopping list item IDs: {', '.join(unknown)}")
+
+        wanted = set(item_ids)
+        edited: list[CookidooIngredientItem | CookidooAdditionalItem] = []
+        if changed := [replace(i, is_owned=owned) for i in ingredients if i.id in wanted]:
+            edited += await api.edit_ingredient_items_ownership(changed)
+        if changed := [replace(i, is_owned=owned) for i in additional if i.id in wanted]:
+            edited += await api.edit_additional_items_ownership(changed)
+        return edited
+
+    async def remove_shopping_items(self, item_ids: list[str]) -> None:
+        """Remove own items. Recipe ingredients go with their recipe."""
+        api = await self.client()
+        await api.remove_additional_items(item_ids)
+
+    async def clear_shopping_list(self) -> None:
+        api = await self.client()
+        await api.clear_shopping_list()
 
     @property
     def localization_url(self) -> str | None:

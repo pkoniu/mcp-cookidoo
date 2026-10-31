@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.2.0] - 2026-10-31
+
+### Added
+- Meal plan: `get_meal_plan`, `add_to_meal_plan` and `remove_from_meal_plan` read and edit the
+  Cookidoo calendar, for catalogue and custom recipes alike
+- Shopping list: `get_shopping_list`, `add_recipes_to_shopping_list`,
+  `remove_recipes_from_shopping_list`, `add_shopping_items`, `mark_shopping_items`,
+  `rename_shopping_item`, `remove_shopping_items` and `clear_shopping_list`
+- `shop_for_meal_plan` adds every recipe planned in a week to the shopping list
+- `plan_my_week` MCP prompt
+
+### Changed
+- Dependencies updated (fastmcp 4.1.4, pydantic 2.14.2, …)
+
 ## [1.1.0] - 2026-10-20
 
 ### Added
